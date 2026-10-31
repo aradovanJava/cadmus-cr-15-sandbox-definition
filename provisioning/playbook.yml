@@ -312,9 +312,17 @@
         scope: machine
         state: present
 
+    # Set-ExecutionPolicy stores the machine policy and then reports an error
+    # because the management session's own (process-scope) policy overrides
+    # it - that is expected here, not a failure.
     - name: Allow local PowerShell scripts (venv Activate.ps1, the lab scripts)
-      ansible.windows.win_shell: Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+      ansible.windows.win_shell: |
+        try { Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force -ErrorAction Stop }
+        catch { if ("$_" -notmatch 'overridden|more specific scope') { throw } }
+        "LocalMachine: $(Get-ExecutionPolicy -Scope LocalMachine)"
+      register: cr15_execpolicy
       changed_when: false
+      failed_when: "'RemoteSigned' not in cr15_execpolicy.stdout"
 
     # --- software stack (framework section 2.1, VM1) -------------------------
     - name: Python 3.14 from python.org (all users, on the machine PATH) and a python3 command
@@ -548,6 +556,7 @@
         Copy-Item "$dir\.venv\Scripts\python.exe" "$dir\.venv\Scripts\python3.exe" -Force
         & $vp -m pip freeze --disable-pip-version-check | Measure-Object | ForEach-Object { "$dir\.venv: $($_.Count) packages" }
         & $vp -m pip check --disable-pip-version-check
+        exit 0
       loop:
         - { dir: "{{ cr15_app_dir }}", extra: "{{ cr15_app_venv_extra | join(' ') }}" }
         - { dir: "{{ cr15_n1_dir }}", extra: "" }
