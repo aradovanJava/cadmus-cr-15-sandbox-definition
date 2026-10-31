@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# CADMUS-CR-15 · OWZ1 · provisioning self-test (not for trainees)
+#
+# While the application runs on SC1 (started by the provisioning for this
+# test only), scan it from OWZ1 the way level A2 does: target
+# http://sc1:{{ cr15_app_port }}/, spider + active scan. A throwaway ZAP container is
+# used, so the trainee's ZAP desktop (container cadmus-zap) starts with an
+# empty session. The full JSON report is kept in /root for the instructor.
+set -u
+W=/opt/cr15/selftest-zap
+rm -rf "$W" && mkdir -p "$W" && chmod 0777 "$W"
+
+code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://sc1:{{ cr15_app_port }}/shop)
+echo "OWZ1 -> http://sc1:{{ cr15_app_port }}/shop : HTTP $code"
+[ "$code" = 200 ] || { echo "application not reachable from OWZ1 (port forward / firewall on SC1?)"; exit 1; }
+
+timeout 2400 docker run --rm --add-host sc1:{{ cr15_ip_sc1 }} -v "$W":/zap/wrk:rw {{ cr15_zap_image }} \
+  zap-full-scan.py -t http://sc1:{{ cr15_app_port }}/ -m 2 -J zap-full.json -I > "$W/zap.log" 2>&1
+rc=$?
+grep -E '^(FAIL-NEW|WARN-NEW|PASS):' "$W/zap.log" | tail -n 3
+[ -s "$W/zap-full.json" ] || { echo "no ZAP report (exit $rc)"; tail -n 5 "$W/zap.log"; exit 1; }
+cp "$W/zap-full.json" /root/cr15-selftest-zap-full.json
+
+jq -r '[.site[].alerts[]] | sort_by(-(.riskcode | tonumber)) | .[] |
+  "\(.riskdesc | split(" ")[0]): \(.alert) @ " +
+  ([.instances[] | .method + " " + (.uri | sub("^https?://[^/]+"; "")) +
+     (if (.param // "") != "" then " [" + .param + "]" else "" end)] | unique | .[0:4] | join(", "))' \
+  "$W/zap-full.json"
+rm -rf "$W"
+true

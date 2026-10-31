@@ -1,0 +1,11 @@
+# CADMUS-CR-15 - Git Bash profile of the trainee (written by the sandbox provisioning)
+#
+# Every Git Bash window - including VS Code's terminal - starts with the
+# application's virtual environment active, so python, python3, pip, bandit,
+# ruff and pip-audit are the lab versions. "deactivate" leaves it.
+# The course guides say "source .venv/bin/activate"; on Windows it is
+#   source .venv/Scripts/activate
+if [ -z "${VIRTUAL_ENV:-}" ] && [ -f "/c/Lab/cadmus-vulnshop-cr/.venv/Scripts/activate" ]; then
+  . "/c/Lab/cadmus-vulnshop-cr/.venv/Scripts/activate"
+fi
+alias vulnshop='cd /c/Lab/cadmus-vulnshop-cr'

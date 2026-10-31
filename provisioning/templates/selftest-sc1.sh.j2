@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# CADMUS-CR-15 · SC1 · provisioning self-test (not for trainees)
+# Runs the course's own scripts in Git Bash, as a trainee would, and prints a
+# one-line result per check. Leaves the application tree as it found it.
+cd "/c/Lab/cadmus-vulnshop-cr" || { echo "application folder missing"; exit 1; }
+. .venv/Scripts/activate || { echo ".venv cannot be activated"; exit 1; }
+out=/c/Windows/Temp/cr15
+rc=0
+
+echo "python3 -> $(command -v python3) (prefix $(python3 -c 'import sys; print(sys.prefix)'))"
+python3 -c "from importlib.metadata import version as v; print('pins kept:', ', '.join('%s %s' % (p, v(p)) for p in ('Flask', 'Werkzeug', 'Jinja2', 'PyYAML', 'requests', 'PyJWT', 'Flask-WTF')))"
+python3 tools/verify_env.py > "$out/verify_env.txt" 2>&1 || rc=1
+echo "verify_env.py: $(grep -E 'ALL CHECKS PASSED|SOMETHING IS MISSING' "$out/verify_env.txt") $(grep MISSING "$out/verify_env.txt" | tr -s ' ' | tr '\n' ';')"
+
+bash tools/scan_static.sh > "$out/scan_static.txt" 2>&1
+python3 -c "import json; r = json.load(open('lab/out/bandit.json'))['results']; print('bandit:', len(r), 'findings -', ' '.join(sorted({x['test_id'] for x in r})))" || rc=1
+echo "ruff (S,BLE): $(grep -E '^Found' lab/out/ruff.txt) - $(ruff check --select BLE --no-cache --output-format concise vulnshop | grep BLE001 | head -n 1)"
+echo "templates: $(grep -E 'finding\(s\)' lab/out/templates.txt)"
+
+if timeout 600 pip-audit -r requirements.txt -f json -o "$out/pip-audit.json" > /dev/null 2>&1 || [ -s "$out/pip-audit.json" ]; then
+  python3 -c "
+import json
+d = json.load(open(r'$out/pip-audit.json'))
+deps = d['dependencies'] if isinstance(d, dict) else d
+hit = [x for x in deps if x.get('vulns')]
+print('pip-audit: %d resolved, %d with advisories - %s' % (len(deps), len(hit), ', '.join('%s %s (%d)' % (x['name'], x['version'], len(x['vulns'])) for x in hit)))"
+else
+  echo "pip-audit: no result (network to pypi.org?)"; rc=1
+fi
+
+rm -rf lab/out vulnshop.db
+find . -name __pycache__ -type d -prune -exec rm -rf {} + 2>/dev/null
+echo "git status after cleanup: $(git status --porcelain | wc -l) changed path(s)"
+exit $rc

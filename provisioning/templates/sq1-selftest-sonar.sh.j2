@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# CADMUS-CR-15 · SQ1 · provisioning self-test (not for trainees)
+#
+# Runs one SonarQube analysis of the application with exactly the settings
+# that C:\Lab\scan-sonar.ps1 uses on SC1, prints what SonarQube reported, and
+# then deletes the project and the token again: the trainee finds an empty
+# SonarQube with the default admin / admin login.
+set -u
+S=http://127.0.0.1:9000
+A='admin:admin'
+KEY={{ cr15_sonar_project_key }}
+W=/opt/cr15/selftest
+
+rm -rf "$W" && mkdir -p "$W"
+git clone -q --depth 1 {{ cr15_app_repo }} "$W/app" || { echo "git clone failed"; exit 1; }
+
+for i in $(seq 1 60); do curl -s "$S/api/system/status" | grep -q '"UP"' && break; sleep 10; done
+curl -s -u "$A" -X POST "$S/api/user_tokens/revoke" --data-urlencode "name=cr15-selftest" >/dev/null
+tok=$(curl -s -u "$A" -X POST "$S/api/user_tokens/generate" \
+      --data-urlencode "name=cr15-selftest" --data-urlencode "type=GLOBAL_ANALYSIS_TOKEN" | jq -r '.token')
+[ -n "$tok" ] && [ "$tok" != null ] || { echo "could not create a token (admin password already changed?)"; exit 1; }
+
+cd "$W/app" || exit 1
+timeout 900 /opt/sonar-scanner/bin/sonar-scanner \
+  -Dsonar.host.url="$S" -Dsonar.token="$tok" \
+  -Dsonar.projectKey="$KEY" -Dsonar.projectName="$KEY" \
+  -Dsonar.sources=. \
+  -Dsonar.exclusions='.venv/**,lab/out/**,**/__pycache__/**,attachments/**,reports/**,.scannerwork/**' \
+  -Dsonar.python.version=3.14 -Dsonar.sourceEncoding=UTF-8 > "$W/scan.log" 2>&1
+rc=$?
+grep -E 'EXECUTION (SUCCESS|FAILURE)|ERROR' "$W/scan.log" | sed 's/^[0-9:.]* //' | tail -n 3
+
+st=''
+for i in $(seq 1 60); do
+  st=$(curl -s -u "$A" "$S/api/ce/component?component=$KEY" | jq -r '.current.status // empty')
+  [ "$st" = SUCCESS ] || [ "$st" = FAILED ] && break; sleep 5
+done
+echo "background task: ${st:-unknown}"
+
+issues=$(curl -s -u "$A" "$S/api/issues/search?components=$KEY&ps=500")
+hot=$(curl -s -u "$A" "$S/api/hotspots/search?project=$KEY&ps=500")
+n=$(echo "$issues" | jq -r '.total')
+nh=$(echo "$hot" | jq -r '.paging.total')
+echo "issues: $n   security hotspots: $nh"
+echo "$hot" | jq -r '.hotspots[] | "hotspot \(.ruleKey) \(.component | sub("^[^:]*:"; "")):\(.line) \(.vulnerabilityProbability)"' | sort
+echo "$issues" | jq -r '.issues[] | select([.impacts[]?.softwareQuality] | index("SECURITY")) |
+  "security issue \(.rule) \(.component | sub("^[^:]*:"; "")):\(.line)"' | sort
+echo "$issues" | jq -r '.issues[].rule' | sort | uniq -c | sort -rn | head -n 8 | awk '{print "issues by rule: " $1 " x " $2}'
+
+curl -s -u "$A" -X POST "$S/api/projects/delete" --data-urlencode "project=$KEY" >/dev/null
+curl -s -u "$A" -X POST "$S/api/user_tokens/revoke" --data-urlencode "name=cr15-selftest" >/dev/null
+left=$(curl -s -u "$A" "$S/api/projects/search?projects=$KEY" | jq -r '.paging.total')
+echo "project removed again: $([ "$left" = 0 ] && echo yes || echo NO)"
+cd / && rm -rf "$W"
+[ "$rc" = 0 ] && [ "${nh:-0}" -gt 0 ]

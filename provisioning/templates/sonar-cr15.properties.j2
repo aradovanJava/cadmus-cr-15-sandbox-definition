@@ -1,0 +1,10 @@
+# CADMUS-CR-15 - SonarQube analysis settings for cadmus-vulnshop-cr
+# Used by {{ cr15_lab_dir }}\scan-sonar.ps1 (sonar-scanner -Dproject.settings=...).
+# Kept outside the repository so the application tree stays as distributed.
+sonar.projectKey={{ cr15_sonar_project_key }}
+sonar.projectName={{ cr15_sonar_project_key }}
+sonar.projectBaseDir={{ cr15_app_dir | replace('\\', '/') }}
+sonar.sources=.
+sonar.exclusions=.venv/**,lab/out/**,**/__pycache__/**,attachments/**,reports/**,.scannerwork/**
+sonar.python.version=3.14
+sonar.sourceEncoding=UTF-8

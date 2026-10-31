@@ -1,0 +1,76 @@
+CADMUS-CR-15  -  Secure Coding Python  -  Cyber Range sandbox
+=============================================================
+
+You are logged in to SC1, the developer workstation (VM1).
+
+Machines in this sandbox
+------------------------
+  SC1   {{ cr15_ip_sc1 }}   Windows workstation (this machine): Python 3.14, Git + Git Bash,
+                        VS Code (Python), Node.js, Maven, SQLMap, Snyk CLI, Postman,
+                        SonarScanner CLI. The application runs HERE.
+  OWZ1  {{ cr15_ip_owz1 }}   OWASP ZAP (DAST) in Docker
+  SQ1   {{ cr15_ip_sq1 }}   SonarQube (SAST) in Docker
+
+Account on all three machines:  {{ cr15_trainee_user }} / {{ cr15_trainee_password }}
+
+The application
+---------------
+  {{ cr15_app_dir }}      cadmus-vulnshop-cr (Flask) - the target of the labs
+  {{ cr15_app_dir }}\.venv   its virtual environment: exactly the pinned requirements,
+                        plus pytest for the CR2-CR4 harnesses
+  bandit, ruff, pip-audit, cyclonedx-py   on the PATH from their own environment
+                        (C:\Tools\labtools) - installed into .venv they would upgrade
+                        the deliberately outdated pins. Do not "pip install" them there.
+                        SBOM of the application's environment:
+                          cyclonedx-py environment .venv/Scripts/python.exe -o lab/out/sbom.json
+
+Open "VulnShop terminal (Git Bash)" on the desktop - or VS Code, whose terminal is
+Git Bash. The virtual environment is already active there. Then:
+
+  python tools/verify_env.py      environment check of the application
+  bash tools/run_app.sh           start it -> http://127.0.0.1:{{ cr15_app_port }}/shop
+  bash tools/scan_static.sh       bandit + ruff + template scanner -> lab/out/
+  bash tools/scan_deps.sh         pip-audit (needs internet)
+
+Training accounts: alice, bob, carol, adminjoe - password Password123.
+The course guides write "source .venv/bin/activate"; on Windows the path is
+.venv/Scripts/activate (already done for you in Git Bash).
+
+URLs (open them in the browser on SC1)
+--------------------------------------
+  The application            http://127.0.0.1:{{ cr15_app_port }}/shop
+  OWASP ZAP desktop          http://owz1:8080/zap/     (proxy port 8090 on owz1)
+  ZAP's target               http://sc1:{{ cr15_app_port }}/           (SC1 forwards it to 127.0.0.1;
+                             only OWZ1 may connect)
+  SonarQube                  http://localhost:9000     (forwarded to SQ1:9000)
+
+SonarQube scan
+--------------
+  powershell -ExecutionPolicy Bypass -File {{ cr15_lab_dir }}\scan-sonar.ps1 -Token <token>
+  First login admin / admin, then set a throwaway password; the token comes from
+  My Account -> Security. Settings: {{ cr15_lab_dir }}\sonar-cr15.properties
+
+Environment check of SC1
+------------------------
+  powershell -ExecutionPolicy Bypass -File {{ cr15_lab_dir }}\verify-cr-env.ps1
+  A tool reported as "not visible in this window": run {{ cr15_lab_dir }}\fix-path.ps1
+
+Also here
+---------
+  {{ cr15_n1_dir }}         the N1 lecture lab (OWASP Top 10:2025, port 5000):
+                             cd {{ cr15_n1_dir }} ; .venv\Scripts\python app.py
+  The CR2-CR4 validation harnesses (cadmus-cr2-validation, cadmus-cr3-validation,
+  cadmus-cr4-pipeline) are on the course LMS; download them into {{ cr15_lab_dir }}.
+
+Level E1 (CI/CD pipeline)
+-------------------------
+GitHub Actions run on GitHub, not in this sandbox. Fork
+{{ cr15_app_repo | regex_replace('\\.git$', '') }}
+to your own GitHub account and add the workflow in the fork.
+
+Safety
+------
+The application is deliberately exploitable and contains an unauthenticated
+remote code execution path (/api/import/session). It binds to 127.0.0.1 - do not
+change the host, do not expose it, do not enter real data. Reset its state with
+  rm -f vulnshop.db

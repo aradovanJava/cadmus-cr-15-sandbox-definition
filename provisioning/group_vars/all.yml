@@ -1,0 +1,126 @@
+# CADMUS-CR-15 · Secure Coding Python · sandbox variables
+#
+# Everything an instructor is likely to change lives here.
+
+# --- Trainee account (same on all three machines) ----------------------------
+# The platform's networking stage already creates "user" / "Password123"
+# (administrator / sudo) on every user-accessible host, and the platform's
+# remote access uses that account. The lab is therefore set up for the same
+# account; changing the password here would lock the platform's console and
+# remote-desktop access out. Lab-only credential - never reuse it elsewhere.
+cr15_trainee_user: user
+cr15_trainee_password: "Password123"
+
+# --- Addressing (must match topology.yml) ------------------------------------
+cr15_ip_sc1: 10.10.10.10
+cr15_ip_sq1: 10.10.10.20
+cr15_ip_owz1: 10.10.10.30
+
+# --- Application under test ---------------------------------------------------
+# cadmus-vulnshop-cr (Python/Flask) is the target of levels A1-E1 and of the
+# course's CR1-CR4 labs. The repository is identical to the participant ZIP on
+# the LMS. It is cloned to C:\Lab\cadmus-vulnshop-cr - the name the course
+# material uses. Trainees fork the repository for level E1 (GitHub Actions).
+cr15_app_repo: https://github.com/aradovanJava/cadmus-vulnshop-python-cr.git
+cr15_lab_dir: C:\Lab
+cr15_app_dir: C:\Lab\cadmus-vulnshop-cr
+cr15_app_port: 8080
+cr15_sonar_project_key: cadmus-vulnshop-cr
+
+# The N1 lecture lab (OWASP Top 10:2025, single-file Flask app on port 5000),
+# placed next to it for the N1 exercises. Set the repo to "" to leave it out.
+cr15_n1_repo: https://github.com/aradovanJava/cadmus-owasp2025-lab-python.git
+cr15_n1_dir: C:\Lab\owasp2025-lab
+
+# The application's virtual environment (C:\Lab\cadmus-vulnshop-cr\.venv)
+# holds exactly its pinned requirements plus pytest (the CR2-CR4 harnesses
+# import the application). The lab tool chain of the CR1-CR4 guides lives in
+# its own environment, C:\Tools\labtools, with its commands on the PATH:
+# installed into the application's environment, pip-audit upgrades the
+# deliberately outdated requests 2.25.1 and cyclonedx-bom upgrades chardet,
+# which would quietly change the very dependency set CR1/CR3 analyse.
+cr15_app_venv_extra:
+  - pytest
+cr15_labtools_packages:
+  - bandit
+  - ruff
+  - pip-audit
+  - cyclonedx-bom
+cr15_labtools_commands:
+  - bandit
+  - ruff
+  - pip-audit
+  - cyclonedx-py
+
+# --- Analysis tools on SQ1 / OWZ1 ---------------------------------------------
+# true  : SonarQube and ZAP are running when the trainee logs in.
+# false : images are pre-pulled but containers are only created, so the
+#         trainee starts them as part of levels A1 / A3
+#         (ssh user@owz1 / sq1, then: cd /opt/cr15 && docker compose up -d).
+cr15_autostart_tools: true
+
+# SonarQube Community Build, pinned (Python is analysed by the built-in
+# analyser - no plugin needed). Tried in order; the first image that pulls is
+# used. The ECR Public mirror of the Docker Official Image comes first because
+# a whole pool pulling from Docker Hub anonymously hits its rate limit.
+cr15_sonarqube_images:
+  - public.ecr.aws/docker/library/sonarqube:26.1.0.118079-community
+  - docker.io/library/sonarqube:26.1.0.118079-community
+  - public.ecr.aws/docker/library/sonarqube:25.8.0.111898-community
+  - docker.io/library/sonarqube:25.8.0.111898-community
+
+cr15_zap_image: ghcr.io/zaproxy/zaproxy:stable
+
+# SonarScanner CLI (Linux, for the SQ1 self-test; Windows, for SC1). Both
+# bundle their own Java runtime.
+cr15_sonar_scanner_linux_urls:
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389-linux-x64.zip
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.2.0.5079-linux-x64.zip
+cr15_sonar_scanner_win_urls:
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-8.1.0.6389-windows-x64.zip
+  - https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-7.2.0.5079-windows-x64.zip
+
+# Python image for the self-tests on SQ1/OWZ1 (runs the application the same
+# way SC1 does, so that ZAP and SonarQube can be checked at provisioning time).
+cr15_python_images:
+  - public.ecr.aws/docker/library/python:3.14-slim
+  - docker.io/library/python:3.14-slim
+
+# Run one ZAP scan (OWZ1) and one SonarQube analysis (SQ1) of the application
+# at every allocation and print the result in the user-ansible log
+# ("SELF-TEST ..." lines). Both clean up after themselves: the trainee's ZAP
+# session and SonarQube start empty, and the SonarQube admin password is
+# untouched (admin / admin, change forced at first login).
+cr15_self_test: true
+
+# --- SC1 software stack (framework section 2.1, VM1) --------------------------
+# Python 3.14 from python.org (Chocolatey's "python" already points at 3.15).
+cr15_python_installer_urls:
+  - https://www.python.org/ftp/python/3.14.9/python-3.14.9-amd64.exe
+  - https://www.python.org/ftp/python/3.14.6/python-3.14.6-amd64.exe
+cr15_python_dir: C:\Python314
+
+cr15_snyk_win_url: https://static.snyk.io/cli/latest/snyk-win.exe
+cr15_sqlmap_repo: https://github.com/sqlmapproject/sqlmap.git
+
+# Installed with Chocolatey, machine-wide, in this order. A failing package
+# fails the sandbox, so only the essentials are here; the JDK that Maven needs
+# is installed separately and may fail without taking SC1 down.
+cr15_choco_packages:
+  - name: git
+  - name: nodejs-lts
+  - name: vscode
+cr15_choco_optional:
+  - temurin21
+  - maven
+
+cr15_vscode_extensions:
+  - ms-python.python
+
+# Postman's installer is per-user only, so it is installed in the trainee's
+# own profile. A failure here is reported but does not fail the sandbox.
+cr15_install_postman: true
+
+# Restart SC1 at the very end, so the first trainee session sees the final
+# machine PATH (a session that existed during provisioning keeps the old one).
+cr15_final_reboot: true

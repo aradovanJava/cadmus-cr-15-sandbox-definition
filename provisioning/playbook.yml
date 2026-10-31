@@ -1,0 +1,774 @@
+---
+# CADMUS-CR-15 · Secure Coding Python (BTCMP-02) · sandbox provisioning
+#
+#   sq1   VM3  SonarQube (SAST) in Docker   Ubuntu 24.04
+#   owz1  VM2  OWASP ZAP (DAST) in Docker   Ubuntu 24.04
+#   sc1   VM1  developer workstation        Windows 11, RDP; runs the application
+#
+# The Linux hosts go first: they are quick, and SonarQube finishes its first
+# start-up while the Windows workstation is still being provisioned. The last
+# three plays are the end-to-end self-test (SC1 runs the application, ZAP on
+# OWZ1 scans it through sc1:8080 exactly as level A2 does) and SC1's clean-up.
+# All tunables are in group_vars/all.yml.
+
+# =============================================================================
+#  SQ1 + OWZ1 - base system, trainee account, Docker Engine
+# =============================================================================
+- name: Docker hosts (SQ1, OWZ1) - base system, trainee account, Docker
+  hosts:
+    - sq1
+    - owz1
+  become: true
+
+  pre_tasks:
+    - name: Stop unattended upgrades so they cannot hold the apt lock
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop:
+        - unattended-upgrades
+        - apt-daily.timer
+        - apt-daily-upgrade.timer
+      failed_when: false
+
+    - name: Wait for any apt/dpkg run started at boot to finish
+      ansible.builtin.shell: |
+        for i in $(seq 1 120); do
+          fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock >/dev/null 2>&1 || exit 0
+          sleep 5
+        done
+      args:
+        executable: /bin/bash
+      changed_when: false
+      failed_when: false
+
+  roles:
+    - role: ansible-role-user-access
+      user_access_username: "{{ cr15_trainee_user }}"
+      user_access_password: "{{ cr15_trainee_password }}"
+      user_access_sudo: true
+
+  tasks:
+    - name: Install Docker Engine, Compose v2 and the self-test helpers
+      ansible.builtin.apt:
+        name:
+          - docker.io
+          - docker-compose-v2
+          - curl
+          - jq
+          - git
+          - unzip
+        state: present
+        update_cache: true
+      register: cr15_apt
+      retries: 3
+      delay: 20
+      until: cr15_apt is succeeded
+
+    - name: Start Docker and enable it at boot
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: Let the trainee run docker without sudo
+      ansible.builtin.user:
+        name: "{{ cr15_trainee_user }}"
+        groups: docker
+        append: true
+
+    - name: Resolve the lab machines by name
+      ansible.builtin.blockinfile:
+        path: /etc/hosts
+        marker: "# {mark} CADMUS-CR-15 lab hosts"
+        block: |
+          {{ cr15_ip_sc1 }} sc1
+          {{ cr15_ip_sq1 }} sq1
+          {{ cr15_ip_owz1 }} owz1
+
+    - name: Compose project directory /opt/cr15
+      ansible.builtin.file:
+        path: /opt/cr15
+        state: directory
+        owner: root
+        group: docker
+        mode: "0775"
+
+# =============================================================================
+#  SQ1 (VM3) - SonarQube Community Build (Python is built in)
+# =============================================================================
+- name: SQ1 (VM3) - SonarQube Community Build
+  hosts: sq1
+  become: true
+
+  tasks:
+    - name: Kernel settings required by SonarQube's embedded Elasticsearch
+      ansible.builtin.copy:
+        dest: /etc/sysctl.d/99-sonarqube.conf
+        content: |
+          vm.max_map_count=524288
+          fs.file-max=131072
+        mode: "0644"
+      register: cr15_sysctl
+
+    - name: Apply kernel settings
+      ansible.builtin.command: sysctl --system
+      when: cr15_sysctl is changed
+      changed_when: true
+
+    - name: Pull SonarQube (first pinned image that answers is used)
+      ansible.builtin.shell: |
+        for img in {{ cr15_sonarqube_images | join(' ') }}; do
+          for attempt in 1 2 3; do
+            if docker pull --quiet "$img" >/dev/null 2>&1; then
+              echo "$img"
+              exit 0
+            fi
+            sleep 15
+          done
+        done
+        echo "could not pull any of: {{ cr15_sonarqube_images | join(' ') }}" >&2
+        exit 1
+      args:
+        executable: /bin/bash
+      register: cr15_sq_pull
+      changed_when: false
+
+    - name: Write /opt/cr15/docker-compose.yml
+      ansible.builtin.template:
+        src: sq1-docker-compose.yml.j2
+        dest: /opt/cr15/docker-compose.yml
+        mode: "0644"
+      vars:
+        cr15_sonarqube_image: "{{ cr15_sq_pull.stdout | trim }}"
+
+    - name: Start SonarQube, or only create the container (cr15_autostart_tools; the self-test needs it running)
+      ansible.builtin.command:
+        cmd: "docker compose {{ 'up -d' if (cr15_autostart_tools or cr15_self_test) else 'create' }}"
+        chdir: /opt/cr15
+      changed_when: true
+
+    - name: Wait until SonarQube reports UP (first start takes a few minutes)
+      ansible.builtin.uri:
+        url: http://127.0.0.1:9000/api/system/status
+        return_content: true
+      register: cr15_sq_status
+      until: cr15_sq_status.json is defined and cr15_sq_status.json.status == 'UP'
+      retries: 60
+      delay: 10
+      when: cr15_autostart_tools or cr15_self_test
+
+    - name: SonarScanner CLI for the self-test (first download that works)
+      ansible.builtin.shell: |
+        set -e
+        [ -x /opt/sonar-scanner/bin/sonar-scanner ] && { echo present; exit 0; }
+        cd /tmp
+        for u in {{ cr15_sonar_scanner_linux_urls | join(' ') }}; do
+          if curl -fsSL --retry 3 -o scanner.zip "$u"; then
+            rm -rf /opt/sonar-scanner /tmp/sonar-scanner-*
+            unzip -q scanner.zip -d /tmp && mv /tmp/sonar-scanner-*/ /opt/sonar-scanner && rm -f scanner.zip
+            echo "installed from $u"; exit 0
+          fi
+        done
+        echo "could not download SonarScanner" >&2; exit 1
+      args:
+        executable: /bin/bash
+      register: cr15_sq_scanner
+      changed_when: "'installed' in cr15_sq_scanner.stdout"
+      when: cr15_self_test
+
+    - name: Self-test script
+      ansible.builtin.template:
+        src: sq1-selftest-sonar.sh.j2
+        dest: /opt/cr15/selftest-sonar.sh
+        mode: "0700"
+      when: cr15_self_test
+
+    - name: Self-test - one SonarQube analysis of the application, then remove it again
+      ansible.builtin.command: /opt/cr15/selftest-sonar.sh
+      register: cr15_selftest_sonar
+      changed_when: false
+      failed_when: false
+      when: cr15_self_test
+
+    - name: Stop SonarQube again if it should not be running for the trainee
+      ansible.builtin.command:
+        cmd: docker compose stop
+        chdir: /opt/cr15
+      when: not cr15_autostart_tools
+      changed_when: true
+
+    - name: Summary (SQ1)
+      ansible.builtin.debug:
+        msg:
+          - "SonarQube image: {{ cr15_sq_pull.stdout | trim }}"
+          - "SELF-TEST sonarqube: {{ 'skipped' if not cr15_self_test else (('PASS' if cr15_selftest_sonar.rc == 0 else 'FAIL') ~ ' | ' ~ (cr15_selftest_sonar.stdout_lines | join(' | '))) }}"
+
+# =============================================================================
+#  OWZ1 (VM2) - OWASP ZAP, desktop UI served through Webswing
+# =============================================================================
+- name: OWZ1 (VM2) - OWASP ZAP
+  hosts: owz1
+  become: true
+
+  tasks:
+    - name: Pull the ZAP image
+      ansible.builtin.command: docker pull --quiet {{ cr15_zap_image }}
+      register: cr15_zap_pull
+      retries: 3
+      delay: 15
+      until: cr15_zap_pull is succeeded
+      changed_when: false
+
+    - name: ZAP working directory (the container runs as uid 1000)
+      ansible.builtin.file:
+        path: /opt/cr15/zap-wrk
+        state: directory
+        owner: "1000"
+        group: "1000"
+        mode: "0775"
+
+    - name: Write /opt/cr15/docker-compose.yml
+      ansible.builtin.template:
+        src: owz1-docker-compose.yml.j2
+        dest: /opt/cr15/docker-compose.yml
+        mode: "0644"
+
+    - name: Start ZAP, or only create the container (cr15_autostart_tools)
+      ansible.builtin.command:
+        cmd: "docker compose {{ 'up -d' if cr15_autostart_tools else 'create' }}"
+        chdir: /opt/cr15
+      changed_when: true
+
+    - name: Wait for the ZAP web UI
+      ansible.builtin.uri:
+        url: http://127.0.0.1:8080/zap/
+        status_code: [200, 302]
+      register: cr15_zap_ui
+      until: cr15_zap_ui is succeeded
+      retries: 30
+      delay: 10
+      when: cr15_autostart_tools
+
+    - name: Self-test script (run after SC1 is up - see the end of this playbook)
+      ansible.builtin.template:
+        src: owz1-selftest-zap.sh.j2
+        dest: /opt/cr15/selftest-zap.sh
+        mode: "0700"
+      when: cr15_self_test
+
+# =============================================================================
+#  SC1 (VM1) - Windows developer workstation
+# =============================================================================
+- name: SC1 (VM1) - Windows developer workstation
+  hosts: sc1
+  gather_facts: false
+
+  pre_tasks:
+    - name: Wait until SC1 accepts management connections
+      ansible.builtin.wait_for_connection:
+        delay: 0
+        sleep: 10
+        timeout: 1800
+
+    - name: Make sure OpenSSH Server exists (the user-access role configures it)
+      ansible.windows.win_shell: |
+        if (Get-Service sshd -ErrorAction SilentlyContinue) { 'present'; exit 0 }
+        Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0 | Out-Null
+        Set-Service sshd -StartupType Automatic
+        Start-Service sshd
+        'installed'
+      register: cr15_sshd
+      changed_when: "'installed' in cr15_sshd.stdout"
+      failed_when: false
+
+  roles:
+    - role: ansible-role-user-access-windows
+      user_access_username: "{{ cr15_trainee_user }}"
+      user_access_password: "{{ cr15_trainee_password }}"
+      user_access_rdp: true
+      user_access_admin: true
+
+  tasks:
+    # --- account and folders --------------------------------------------------
+    - name: Keep the trainee password from expiring during the course
+      ansible.windows.win_user:
+        name: "{{ cr15_trainee_user }}"
+        password_never_expires: true
+
+    - name: Folders for tools, lab material and installers
+      ansible.windows.win_file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - C:\Tools\bin
+        - "{{ cr15_lab_dir }}"
+        - C:\Windows\Temp\cr15
+
+    - name: Put C:\Tools\bin on the machine PATH
+      ansible.windows.win_path:
+        elements: C:\Tools\bin
+        scope: machine
+        state: present
+
+    - name: Allow local PowerShell scripts (venv Activate.ps1, the lab scripts)
+      ansible.windows.win_shell: Set-ExecutionPolicy RemoteSigned -Scope LocalMachine -Force
+      changed_when: false
+
+    # --- software stack (framework section 2.1, VM1) -------------------------
+    - name: Python 3.14 from python.org (all users, on the machine PATH) and a python3 command
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $dir = '{{ cr15_python_dir }}'
+        $state = 'present'
+        if (-not (Test-Path "$dir\python.exe")) {
+          $exe = 'C:\Windows\Temp\cr15\python-installer.exe'
+          $got = $null
+          foreach ($u in @('{{ cr15_python_installer_urls | join("','") }}')) {
+            for ($i = 1; $i -le 3 -and -not $got; $i++) {
+              try { Invoke-WebRequest -Uri $u -OutFile $exe -UseBasicParsing; $got = $u } catch { Start-Sleep -Seconds 15 }
+            }
+            if ($got) { break }
+          }
+          if (-not $got) { throw 'could not download a Python 3.14 installer' }
+          $p = Start-Process $exe -Wait -PassThru -ArgumentList @('/quiet', 'InstallAllUsers=1', 'PrependPath=1',
+                 'Include_launcher=1', 'Include_test=0', "TargetDir=$dir", '/log', 'C:\Windows\Temp\cr15\python-install.log')
+          if ($p.ExitCode -notin 0, 3010) { throw "Python installer exit code $($p.ExitCode)" }
+          Remove-Item $exe -Force
+          $state = "installed from $got"
+        }
+        # The course scripts call python3. On Windows that name is a Microsoft
+        # Store alias (user PATH); a python3.exe next to python.exe on the
+        # machine PATH resolves first.
+        if (-not (Test-Path "$dir\python3.exe")) { New-Item -ItemType HardLink -Path "$dir\python3.exe" -Target "$dir\python.exe" | Out-Null }
+        "$state - $(& "$dir\python.exe" --version)"
+      register: cr15_python
+
+    - name: Python and its Scripts folder on the machine PATH
+      ansible.windows.win_path:
+        elements:
+          - "{{ cr15_python_dir }}"
+          - '{{ cr15_python_dir }}\Scripts'
+        scope: machine
+        state: present
+
+    - name: Chocolatey packages (git, Node.js LTS, VS Code)
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ item.name }}"
+        install_args: "{{ item.install_args | default(omit) }}"
+        state: present
+      loop: "{{ cr15_choco_packages }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: cr15_choco
+      retries: 3
+      delay: 30
+      until: cr15_choco is succeeded
+
+    - name: Git Bash (bash.exe) on the machine PATH - the course scripts are bash
+      ansible.windows.win_path:
+        elements: C:\Program Files\Git\bin
+        scope: machine
+        state: present
+
+    - name: Maven and the JDK it needs (framework list; not used by the Python labs)
+      chocolatey.chocolatey.win_chocolatey:
+        name: "{{ item }}"
+        state: present
+      loop: "{{ cr15_choco_optional }}"
+      register: cr15_choco_opt
+      ignore_errors: true
+
+    - name: Snyk CLI
+      ansible.windows.win_get_url:
+        url: "{{ cr15_snyk_win_url }}"
+        dest: C:\Tools\bin\snyk.exe
+        force: false
+      register: cr15_snyk
+      retries: 3
+      delay: 20
+      until: cr15_snyk is succeeded
+
+    - name: Keep Defender away from the SQLMap checkout (it ships test payloads)
+      ansible.windows.win_shell: Add-MpPreference -ExclusionPath 'C:\Tools\sqlmap'
+      changed_when: false
+      failed_when: false
+
+    - name: SQLMap (clone of the official repository)
+      ansible.windows.win_shell: |
+        $env:GIT_TERMINAL_PROMPT = '0'; $env:GCM_INTERACTIVE = 'never'
+        & 'C:\Program Files\Git\cmd\git.exe' clone --quiet --depth 1 {{ cr15_sqlmap_repo }} C:\Tools\sqlmap
+        if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
+      args:
+        creates: C:\Tools\sqlmap\sqlmap.py
+      register: cr15_sqlmap
+      retries: 3
+      delay: 20
+      until: cr15_sqlmap is succeeded
+
+    - name: SQLMap command on the PATH
+      ansible.windows.win_copy:
+        dest: C:\Tools\bin\sqlmap.cmd
+        content: "@echo off\r\n\"{{ cr15_python_dir }}\\python.exe\" \"C:\\Tools\\sqlmap\\sqlmap.py\" %*\r\n"
+
+    - name: SonarScanner CLI for Windows (bundles its own Java)
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        if (Test-Path 'C:\Tools\sonar-scanner\bin\sonar-scanner.bat') { 'present'; exit 0 }
+        $zip = 'C:\Windows\Temp\cr15\sonar-scanner.zip'
+        $got = $null
+        foreach ($u in @('{{ cr15_sonar_scanner_win_urls | join("','") }}')) {
+          for ($i = 1; $i -le 3 -and -not $got; $i++) {
+            try { Invoke-WebRequest -Uri $u -OutFile $zip -UseBasicParsing; $got = $u } catch { Start-Sleep -Seconds 15 }
+          }
+          if ($got) { break }
+        }
+        if (-not $got) { throw 'could not download SonarScanner' }
+        $tmp = 'C:\Windows\Temp\cr15\sonar-scanner'
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        Expand-Archive -Path $zip -DestinationPath $tmp -Force
+        $inner = Get-ChildItem $tmp -Directory | Select-Object -First 1
+        Move-Item $inner.FullName 'C:\Tools\sonar-scanner'
+        Remove-Item $zip, $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        "installed from $got"
+      register: cr15_scanner
+      changed_when: "'installed' in cr15_scanner.stdout"
+
+    - name: SonarScanner on the machine PATH
+      ansible.windows.win_path:
+        elements: C:\Tools\sonar-scanner\bin
+        scope: machine
+        state: present
+
+    - name: Lab tool chain in its own environment (bandit, ruff, pip-audit, cyclonedx-bom), commands in C:\Tools\bin
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Continue'
+        $py = '{{ cr15_python_dir }}\python.exe'
+        $venv = 'C:\Tools\labtools'
+        if (-not (Test-Path "$venv\Scripts\python.exe")) { & $py -m venv $venv; if ($LASTEXITCODE) { exit 1 } }
+        & "$venv\Scripts\python.exe" -m pip install --disable-pip-version-check -q {{ cr15_labtools_packages | join(' ') }} 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE) { "pip install failed ($LASTEXITCODE)"; exit 1 }
+        # The console-script launchers carry the absolute path of their own
+        # interpreter, so copies on the PATH still run in C:\Tools\labtools.
+        foreach ($c in @('{{ cr15_labtools_commands | join("','") }}')) {
+          Copy-Item "$venv\Scripts\$c.exe" "C:\Tools\bin\$c.exe" -Force
+          "{0,-14} {1}" -f $c, ((& "C:\Tools\bin\$c.exe" --version 2>&1 | Select-Object -First 1) -as [string])
+        }
+      register: cr15_labtools
+      retries: 2
+      delay: 30
+      until: cr15_labtools is succeeded
+
+    - name: Postman (per-user installer, so it is installed as the trainee)
+      chocolatey.chocolatey.win_chocolatey:
+        name: postman
+        state: present
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr15_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr15_trainee_password }}"
+      when: cr15_install_postman
+      register: cr15_postman
+      ignore_errors: true
+
+    # --- networking between the three lab machines ---------------------------
+    - name: Resolve the lab machines by name
+      ansible.windows.win_shell: |
+        $hosts = 'C:\Windows\System32\drivers\etc\hosts'
+        $entries = [ordered]@{ 'sc1' = '{{ cr15_ip_sc1 }}'; 'sq1' = '{{ cr15_ip_sq1 }}'; 'owz1' = '{{ cr15_ip_owz1 }}' }
+        $lines = @(Get-Content $hosts -ErrorAction SilentlyContinue | Where-Object {
+          $_ -notmatch ('^\s*\S+\s+(' + (($entries.Keys) -join '|') + ')\s*$') })
+        foreach ($name in $entries.Keys) { $lines += "$($entries[$name]) $name" }
+        Set-Content -Path $hosts -Value $lines -Encoding ASCII
+        Clear-DnsClientCache
+      changed_when: false
+
+    # localhost:9000 -> SQ1:9000 so SonarQube is http://localhost:9000 on SC1.
+    # sc1:8080 -> 127.0.0.1:8080 lets ZAP on OWZ1 reach the application while
+    # the application itself stays bound to loopback; the firewall rule admits
+    # that port from OWZ1 only.
+    - name: Port forwarding for SonarQube and for the ZAP target, firewall rule
+      ansible.windows.win_shell: |
+        Set-Service iphlpsvc -StartupType Automatic
+        Start-Service iphlpsvc
+        netsh interface portproxy reset | Out-Null
+        netsh interface portproxy add v4tov4 listenaddress=127.0.0.1 listenport=9000 connectaddress={{ cr15_ip_sq1 }} connectport=9000 | Out-Null
+        netsh interface portproxy add v6tov4 listenaddress=::1 listenport=9000 connectaddress={{ cr15_ip_sq1 }} connectport=9000 | Out-Null
+        netsh interface portproxy add v4tov4 listenaddress={{ cr15_ip_sc1 }} listenport={{ cr15_app_port }} connectaddress=127.0.0.1 connectport={{ cr15_app_port }} | Out-Null
+        Get-NetFirewallRule -Name 'CR15-VulnShop-OWZ1' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+        New-NetFirewallRule -Name 'CR15-VulnShop-OWZ1' -DisplayName 'CADMUS-CR-15 VulnShop {{ cr15_app_port }} - OWASP ZAP host only' `
+          -Direction Inbound -Protocol TCP -LocalPort {{ cr15_app_port }} -RemoteAddress {{ cr15_ip_owz1 }} -Action Allow -Profile Any | Out-Null
+        netsh interface portproxy show v4tov4
+      register: cr15_portproxy
+      changed_when: false
+
+    # --- lab material ----------------------------------------------------------
+    - name: Clone the application under test and the N1 lab
+      ansible.windows.win_shell: |
+        $env:GIT_TERMINAL_PROMPT = '0'; $env:GCM_INTERACTIVE = 'never'
+        if (-not (Test-Path '{{ item.dir }}\app.py')) {
+          & 'C:\Program Files\Git\cmd\git.exe' clone --quiet {{ item.repo }} '{{ item.dir }}'
+          if ($LASTEXITCODE -ne 0) { throw "git clone failed with exit code $LASTEXITCODE" }
+        }
+        # Local files that are not part of the application stay out of "git status".
+        Add-Content -Path '{{ item.dir }}\.git\info\exclude' -Encoding ASCII -Value @(
+          '# CADMUS-CR-15 sandbox: local files that are not part of the repository',
+          '.venv/', '*.db', 'lab/out/', '__pycache__/', '.scannerwork/', '.vscode/')
+        & 'C:\Program Files\Git\cmd\git.exe' -C '{{ item.dir }}' log --oneline -1
+      loop:
+        - { repo: "{{ cr15_app_repo }}", dir: "{{ cr15_app_dir }}" }
+        - { repo: "{{ cr15_n1_repo }}", dir: "{{ cr15_n1_dir }}" }
+      loop_control:
+        label: "{{ item.dir }}"
+      when: item.repo | length > 0
+      register: cr15_clone
+      retries: 3
+      delay: 20
+      until: cr15_clone is succeeded
+      # A missing application must not take the whole workstation down with
+      # it; the summary and verify-cr-env.ps1 both report it.
+      ignore_errors: true
+
+    - name: Virtual environments - exactly the pinned requirements (+ pytest for the CR2-CR4 harnesses)
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Continue'
+        $dir = '{{ item.dir }}'
+        if (-not (Test-Path "$dir\requirements.txt")) { "no application in $dir"; exit 1 }
+        if (-not (Test-Path "$dir\.venv\Scripts\python.exe")) { & '{{ cr15_python_dir }}\python.exe' -m venv "$dir\.venv"; if ($LASTEXITCODE) { exit 1 } }
+        $vp = "$dir\.venv\Scripts\python.exe"
+        & $vp -m pip install --disable-pip-version-check -q -r "$dir\requirements.txt" {{ item.extra }} 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE) { "pip install failed ($LASTEXITCODE)"; exit 1 }
+        # python3 inside the environment too (tools/run_app.sh runs "python3 app.py")
+        Copy-Item "$dir\.venv\Scripts\python.exe" "$dir\.venv\Scripts\python3.exe" -Force
+        & $vp -m pip freeze --disable-pip-version-check | Measure-Object | ForEach-Object { "$dir\.venv: $($_.Count) packages" }
+        & $vp -m pip check --disable-pip-version-check
+      loop:
+        - { dir: "{{ cr15_app_dir }}", extra: "{{ cr15_app_venv_extra | join(' ') }}" }
+        - { dir: "{{ cr15_n1_dir }}", extra: "" }
+      loop_control:
+        label: "{{ item.dir }}"
+      when: item.dir != cr15_n1_dir or cr15_n1_repo | length > 0
+      register: cr15_venv
+      retries: 2
+      delay: 30
+      until: cr15_venv is succeeded
+      ignore_errors: true
+
+    - name: Lab scripts, SonarQube settings and the environment check
+      ansible.windows.win_template:
+        src: "{{ item.src }}"
+        dest: '{{ cr15_lab_dir }}\{{ item.dest }}'
+      loop:
+        - { src: verify-cr-env.ps1.j2, dest: verify-cr-env.ps1 }
+        - { src: fix-path.ps1.j2, dest: fix-path.ps1 }
+        - { src: scan-sonar.ps1.j2, dest: scan-sonar.ps1 }
+        - { src: sonar-cr15.properties.j2, dest: sonar-cr15.properties }
+
+    - name: Hand the lab folder to the trainee (git refuses repositories owned by another user)
+      ansible.windows.win_shell: |
+        icacls '{{ cr15_lab_dir }}' /setowner {{ cr15_trainee_user }} /T /C /Q | Out-Null
+        icacls '{{ cr15_lab_dir }}' /grant '{{ cr15_trainee_user }}:(OI)(CI)F' /T /C /Q | Out-Null
+        & 'C:\Program Files\Git\cmd\git.exe' config --system --replace-all safe.directory '*'
+      changed_when: false
+
+    # --- the trainee's own profile ---------------------------------------------
+    - name: VS Code Python extension and settings (Git Bash terminal, the application's interpreter)
+      ansible.windows.win_shell: |
+        $code = 'C:\Program Files\Microsoft VS Code\bin\code.cmd'
+        if (-not (Test-Path $code)) { throw "VS Code not found at $code" }
+        foreach ($ext in @('{{ cr15_vscode_extensions | join("','") }}')) {
+          & $code --install-extension $ext --force 2>&1 | ForEach-Object { "$_" }
+          if ($LASTEXITCODE -ne 0) { throw "code --install-extension $ext failed with exit code $LASTEXITCODE" }
+        }
+        $settingsDir = Join-Path $env:APPDATA 'Code\User'
+        New-Item -ItemType Directory -Force -Path $settingsDir | Out-Null
+        $settings = Join-Path $settingsDir 'settings.json'
+        if (-not (Test-Path $settings)) {
+          @{
+            'terminal.integrated.defaultProfile.windows' = 'Git Bash'
+            'python.defaultInterpreterPath'              = '{{ cr15_app_dir }}\.venv\Scripts\python.exe'
+            'python.terminal.activateEnvironment'        = $false
+          } | ConvertTo-Json | Set-Content -Path $settings -Encoding ASCII
+        }
+        & $code --list-extensions
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr15_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr15_trainee_password }}"
+      register: cr15_vscode_ext
+      retries: 2
+      delay: 20
+      until: cr15_vscode_ext is succeeded
+      changed_when: false
+      ignore_errors: true
+
+    - name: Git Bash profile - the application's virtual environment is active in every Git Bash
+      ansible.windows.win_shell: |
+        $rc = [Text.Encoding]::ASCII.GetString([Convert]::FromBase64String('{{ lookup('ansible.builtin.template', 'bashrc.j2') | b64encode }}'))
+        [IO.File]::WriteAllText((Join-Path $env:USERPROFILE '.bashrc'), $rc.Replace("`r`n", "`n"))
+        [IO.File]::WriteAllText((Join-Path $env:USERPROFILE '.bash_profile'), "test -f ~/.bashrc && . ~/.bashrc`n")
+        Get-ChildItem $env:USERPROFILE -Force -Filter '.bash*' | ForEach-Object { $_.Name }
+      become: true
+      become_method: ansible.builtin.runas
+      become_user: "{{ cr15_trainee_user }}"
+      vars:
+        ansible_become_password: "{{ cr15_trainee_password }}"
+      register: cr15_bashrc
+      changed_when: false
+      ignore_errors: true
+
+    - name: README on the desktop
+      ansible.windows.win_template:
+        src: sc1-README.txt.j2
+        dest: C:\Users\Public\Desktop\CR-15 Sandbox README.txt
+
+    - name: Browser shortcuts on the desktop
+      ansible.windows.win_copy:
+        dest: 'C:\Users\Public\Desktop\{{ item.name }}.url'
+        content: "[InternetShortcut]\r\nURL={{ item.url }}\r\n"
+      loop:
+        - { name: "SonarQube (SQ1)", url: "http://localhost:9000/" }
+        - { name: "OWASP ZAP (OWZ1)", url: "http://owz1:8080/zap/" }
+        - { name: "VulnShop (after run_app)", url: "http://127.0.0.1:{{ cr15_app_port }}/shop" }
+
+    - name: Desktop shortcuts - VulnShop terminal (Git Bash) and Lab folder
+      ansible.windows.win_shell: |
+        $w = New-Object -ComObject WScript.Shell
+        $s = $w.CreateShortcut('C:\Users\Public\Desktop\VulnShop terminal (Git Bash).lnk')
+        $s.TargetPath = 'C:\Program Files\Git\git-bash.exe'
+        $s.Arguments  = '--cd="{{ cr15_app_dir }}"'
+        $s.WorkingDirectory = '{{ cr15_app_dir }}'
+        $s.Save()
+        $s = $w.CreateShortcut('C:\Users\Public\Desktop\Lab folder.lnk')
+        $s.TargetPath = '{{ cr15_lab_dir }}'
+        $s.Save()
+      changed_when: false
+
+    # --- self-test, part 1: the course scripts, then start the application ----
+    - name: Self-test scripts
+      ansible.windows.win_template:
+        src: "{{ item.src }}"
+        dest: 'C:\Windows\Temp\cr15\{{ item.dest }}'
+        newline_sequence: "{{ item.nl }}"
+      loop:
+        - { src: selftest-sc1.sh.j2, dest: selftest-sc1.sh, nl: "\n" }
+        - { src: selftest-run-app.cmd.j2, dest: selftest-run-app.cmd, nl: "\r\n" }
+      when: cr15_self_test
+
+    - name: Self-test - the course's own scripts in Git Bash (verify_env, scan_static, pip-audit)
+      ansible.windows.win_shell: |
+        $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        & 'C:\Program Files\Git\bin\bash.exe' C:/Windows/Temp/cr15/selftest-sc1.sh 2>&1 | ForEach-Object { "$_" }
+        exit $LASTEXITCODE
+      register: cr15_selftest_sc1
+      changed_when: false
+      failed_when: false
+      when: cr15_self_test
+
+    - name: Self-test - start the application (as the trainee) for the ZAP check from OWZ1
+      ansible.windows.win_shell: |
+        icacls '{{ cr15_lab_dir }}' /setowner {{ cr15_trainee_user }} /T /C /Q | Out-Null
+        icacls 'C:\Windows\Temp\cr15' /grant '{{ cr15_trainee_user }}:(OI)(CI)M' /C /Q | Out-Null
+        $a = New-ScheduledTaskAction -Execute 'C:\Windows\Temp\cr15\selftest-run-app.cmd'
+        Register-ScheduledTask -TaskName 'CR15-selftest-app' -Action $a -User '{{ cr15_trainee_user }}' `
+          -Password '{{ cr15_trainee_password }}' -RunLevel Limited -Force | Out-Null
+        Start-ScheduledTask -TaskName 'CR15-selftest-app'
+        for ($i = 0; $i -lt 45; $i++) {
+          try {
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:{{ cr15_app_port }}/shop' -UseBasicParsing -TimeoutSec 5
+            if ($r.StatusCode -eq 200) { "application up on 127.0.0.1:{{ cr15_app_port }}"; exit 0 }
+          } catch { }
+          Start-Sleep -Seconds 2
+        }
+        "application did not start:"
+        Get-Content 'C:\Windows\Temp\cr15\selftest-app.log' -ErrorAction SilentlyContinue | Select-Object -Last 8
+        exit 1
+      register: cr15_selftest_app
+      changed_when: false
+      failed_when: false
+      when: cr15_self_test
+
+# =============================================================================
+#  Self-test, part 2: ZAP on OWZ1 scans the application on SC1 (as in A2)
+# =============================================================================
+- name: OWZ1 - self-test, ZAP scan of http://sc1:{{ cr15_app_port }}/
+  hosts: owz1
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Self-test - spider + active scan of the application through sc1:{{ cr15_app_port }}
+      ansible.builtin.command: /opt/cr15/selftest-zap.sh
+      register: cr15_selftest_zap
+      changed_when: false
+      failed_when: false
+      when: cr15_self_test and ((hostvars['sc1']['cr15_selftest_app'] | default({})).rc | default(1)) == 0
+
+    - name: Summary (OWZ1)
+      ansible.builtin.debug:
+        msg:
+          - >-
+            SELF-TEST zap: {{ 'skipped' if not cr15_self_test
+            else ('not run - the application did not start on SC1' if cr15_selftest_zap is skipped
+            else (('PASS' if cr15_selftest_zap.rc == 0 else 'FAIL') ~ ' | ' ~ (cr15_selftest_zap.stdout_lines | join(' | ')))) }}
+
+# =============================================================================
+#  SC1 - stop the self-test application, clean up, summary, restart
+# =============================================================================
+- name: SC1 - finish
+  hosts: sc1
+  gather_facts: false
+
+  tasks:
+    - name: Stop the self-test application and leave the tree as distributed
+      ansible.windows.win_shell: |
+        Stop-ScheduledTask -TaskName 'CR15-selftest-app' -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName 'CR15-selftest-app' -Confirm:$false -ErrorAction SilentlyContinue
+        Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'python3.exe'" |
+          Where-Object { $_.CommandLine -match 'app\.py' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+        $app = '{{ cr15_app_dir }}'
+        Remove-Item "$app\vulnshop.db", "$app\lab\out" -Recurse -Force -ErrorAction SilentlyContinue
+        Get-ChildItem $app -Recurse -Directory -Filter '__pycache__' -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -notlike "$app\.venv*" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        & 'C:\Program Files\Git\cmd\git.exe' -C $app checkout -- . 2>&1 | Out-Null
+        Remove-Item 'C:\Windows\Temp\cr15\selftest-*' -Force -ErrorAction SilentlyContinue
+        "git status: $((& 'C:\Program Files\Git\cmd\git.exe' -C $app status --porcelain | Measure-Object).Count) changed path(s)"
+      register: cr15_cleanup
+      changed_when: false
+      when: cr15_self_test
+
+    - name: Summary (SC1)
+      ansible.builtin.debug:
+        msg:
+          - "{{ cr15_python.stdout | trim }}"
+          - "Lab tools: {{ cr15_labtools.stdout_lines | default([]) | select('match', '^(bandit|ruff|pip-audit|cyclonedx-py) ') | join(' | ') }}"
+          - "Virtual environments: {{ cr15_venv.results | default([]) | map(attribute='stdout_lines', default=[]) | flatten | select('search', 'packages|No broken|has requirement|failed') | join(' | ') }}"
+          - "Maven/JDK: {{ 'FAILED (optional)' if cr15_choco_opt is failed else 'installed' }}"
+          - >-
+            Postman: {{ 'skipped' if not cr15_install_postman
+            else ('FAILED - install it manually as ' ~ cr15_trainee_user if cr15_postman is failed else 'installed') }}
+          - >-
+            VS Code extensions: {{ ('FAILED - ' ~ (cr15_vscode_ext.msg | default('see log')))
+            if cr15_vscode_ext is failed else (cr15_vscode_ext.stdout_lines | default([]) | select('match', '^ms-') | join(', ')) }}
+          - "Git Bash profile: {{ 'FAILED' if cr15_bashrc is failed else 'written' }}"
+          - "Clones: {{ cr15_clone.results | default([]) | map(attribute='stdout', default='-') | map('trim') | join(' | ') }}{{ ' (A CLONE FAILED - see the log)' if cr15_clone is failed else '' }}"
+          - "SELF-TEST sc1: {{ 'skipped' if not cr15_self_test else (('PASS' if cr15_selftest_sc1.rc == 0 else 'FAIL') ~ ' | ' ~ (cr15_selftest_sc1.stdout_lines | join(' | '))) }}"
+          - "SELF-TEST app start: {{ cr15_selftest_app.stdout_lines | default(['skipped']) | join(' | ') }} | cleanup: {{ cr15_cleanup.stdout | default('') | trim }}"
+          - "{{ cr15_portproxy.stdout_lines | default([]) }}"
+
+    # A desktop session that existed while provisioning changed the machine
+    # PATH keeps the old PATH. Restarting last means the trainee's first
+    # session sees every tool.
+    - name: Restart SC1 so the first trainee session starts with the final PATH
+      ansible.windows.win_reboot:
+        reboot_timeout: 1800
+        post_reboot_delay: 30
+      when: cr15_final_reboot

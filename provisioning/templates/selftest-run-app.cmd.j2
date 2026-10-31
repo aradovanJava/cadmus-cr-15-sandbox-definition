@@ -1,0 +1,5 @@
+@echo off
+rem CADMUS-CR-15 - provisioning self-test only: runs the application for the
+rem end-to-end ZAP check from OWZ1, then the scheduled task is removed again.
+cd /d "{{ cr15_app_dir }}"
+"{{ cr15_app_dir }}\.venv\Scripts\python.exe" app.py > "C:\Windows\Temp\cr15\selftest-app.log" 2>&1
