@@ -707,23 +707,27 @@
       failed_when: false
       when: cr15_self_test
 
-    - name: Self-test - start the application (as the trainee) for the ZAP check from OWZ1
+    # A process started from the management SSH session dies with the session,
+    # so the application runs as a scheduled task (SYSTEM) for the length of
+    # the ZAP check; the finish play removes the task and everything it wrote.
+    - name: Self-test - start the application for the ZAP check from OWZ1
       ansible.windows.win_shell: |
-        icacls '{{ cr15_lab_dir }}' /setowner {{ cr15_trainee_user }} /T /C /Q | Out-Null
-        icacls 'C:\Windows\Temp\cr15' /grant '{{ cr15_trainee_user }}:(OI)(CI)M' /C /Q | Out-Null
         $a = New-ScheduledTaskAction -Execute 'C:\Windows\Temp\cr15\selftest-run-app.cmd'
-        Register-ScheduledTask -TaskName 'CR15-selftest-app' -Action $a -User '{{ cr15_trainee_user }}' `
-          -Password '{{ cr15_trainee_password }}' -RunLevel Limited -Force | Out-Null
+        Register-ScheduledTask -TaskName 'CR15-selftest-app' -Action $a -User 'NT AUTHORITY\SYSTEM' -RunLevel Highest -Force | Out-Null
         Start-ScheduledTask -TaskName 'CR15-selftest-app'
         for ($i = 0; $i -lt 45; $i++) {
           try {
             $r = Invoke-WebRequest -Uri 'http://127.0.0.1:{{ cr15_app_port }}/shop' -UseBasicParsing -TimeoutSec 5
-            if ($r.StatusCode -eq 200) { "application up on 127.0.0.1:{{ cr15_app_port }}"; exit 0 }
-          } catch { }
+            if ($r.StatusCode -eq 200) { "application up on 127.0.0.1:{{ cr15_app_port }} (scheduled task, SYSTEM)"; exit 0 }
+          } catch { $last = "$_" }
           Start-Sleep -Seconds 2
         }
-        "application did not start:"
-        Get-Content 'C:\Windows\Temp\cr15\selftest-app.log' -ErrorAction SilentlyContinue | Select-Object -Last 8
+        "application did not start - last error: $last"
+        $t = Get-ScheduledTask -TaskName 'CR15-selftest-app' -ErrorAction SilentlyContinue
+        $ti = Get-ScheduledTaskInfo -TaskName 'CR15-selftest-app' -ErrorAction SilentlyContinue
+        "task state: $($t.State)  last run: $($ti.LastRunTime)  last result: $($ti.LastTaskResult)"
+        netstat -ano | Select-String ':{{ cr15_app_port }}\s' | ForEach-Object { "netstat: $_" }
+        Get-Content 'C:\Windows\Temp\cr15\selftest-app.log' -ErrorAction SilentlyContinue | Select-Object -Last 8 | ForEach-Object { "app log: $_" }
         exit 1
       register: cr15_selftest_app
       changed_when: false
@@ -775,6 +779,7 @@
           Where-Object { $_.FullName -notlike "$app\.venv*" } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
         & 'C:\Program Files\Git\cmd\git.exe' -C $app checkout -- . 2>&1 | Out-Null
         Remove-Item 'C:\Windows\Temp\cr15\selftest-*' -Force -ErrorAction SilentlyContinue
+        icacls '{{ cr15_lab_dir }}' /setowner {{ cr15_trainee_user }} /T /C /Q | Out-Null
         "git status: $((& 'C:\Program Files\Git\cmd\git.exe' -C $app status --porcelain | Measure-Object).Count) changed path(s)"
       register: cr15_cleanup
       changed_when: false
