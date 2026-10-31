@@ -5,6 +5,7 @@
 cd "/c/Lab/cadmus-vulnshop-cr" || { echo "application folder missing"; exit 1; }
 . .venv/Scripts/activate || { echo ".venv cannot be activated"; exit 1; }
 out=/c/Windows/Temp/cr15
+outw=C:/Windows/Temp/cr15          # the same folder, as Windows Python sees it
 rc=0
 
 echo "python3 -> $(command -v python3) (prefix $(python3 -c 'import sys; print(sys.prefix)'))"
@@ -20,7 +21,7 @@ echo "templates: $(grep -E 'finding\(s\)' lab/out/templates.txt)"
 if timeout 600 pip-audit -r requirements.txt -f json -o "$out/pip-audit.json" > /dev/null 2>&1 || [ -s "$out/pip-audit.json" ]; then
   python3 -c "
 import json
-d = json.load(open(r'$out/pip-audit.json'))
+d = json.load(open(r'$outw/pip-audit.json'))
 deps = d['dependencies'] if isinstance(d, dict) else d
 hit = [x for x in deps if x.get('vulns')]
 print('pip-audit: %d resolved, %d with advisories - %s' % (len(deps), len(hit), ', '.join('%s %s (%d)' % (x['name'], x['version'], len(x['vulns'])) for x in hit)))"

@@ -88,8 +88,14 @@ Credentials and every other tunable are in `provisioning/group_vars/all.yml`.
    `pip-audit -r requirements.txt` resolves the pins on its own, so results are
    unchanged; for an SBOM of the application's environment use
    `cyclonedx-py environment .venv/Scripts/python.exe`.
-5. **PyYAML 5.3.1** has no wheel for Python 3.14; it installs from source as
-   pure Python (no C compiler needed — verified on 3.12, 3.13 and 3.14).
+5. **PyYAML 5.3.1** (a deliberate pin) has no wheel for Python 3.14. On Linux
+   its source build falls back to pure Python; on Windows it stops with
+   "Microsoft Visual C++ 14.0 or greater is required", because recent
+   setuptools reports the missing compiler with an exception PyYAML 5.3.1 does
+   not catch. SC1 builds it once with `--without-libyaml` as a pure-Python
+   `py3-none-any` wheel in `C:\Tools\wheelhouse`, and `C:\ProgramData\pip\pip.ini`
+   (`find-links`) makes every pip on the machine use it — including a
+   trainee's own `pip install -r requirements.txt` and pip-audit.
 6. **SonarQube is pinned** (26.1.0.118079 Community, fallback 25.8) and pulled
    from the ECR Public mirror of the Docker Official Image first. Python is
    analysed by the built-in analyser. `C:\Lab\scan-sonar.ps1 -WithLinters`

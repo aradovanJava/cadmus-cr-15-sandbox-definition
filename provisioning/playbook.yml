@@ -453,6 +453,32 @@
         scope: machine
         state: present
 
+    # PyYAML 5.3.1 (a deliberate pin) has no wheel for current Python, and on
+    # Windows its source build stops with "Microsoft Visual C++ 14.0 or
+    # greater is required" - recent setuptools reports the missing compiler
+    # with an exception PyYAML 5.3.1's fallback does not catch. Built once with
+    # --without-libyaml it is a pure-Python py3-none-any wheel; a machine-wide
+    # find-links makes every pip on SC1 use it - the .venv, a trainee's own
+    # "pip install -r requirements.txt", and the throwaway environment
+    # pip-audit builds for "pip-audit -r requirements.txt".
+    - name: PyYAML 5.3.1 as a pure-Python wheel, used by every pip on SC1 (no C compiler needed)
+      ansible.windows.win_shell: |
+        $ErrorActionPreference = 'Continue'
+        $wh = 'C:\Tools\wheelhouse'
+        New-Item -ItemType Directory -Force -Path $wh | Out-Null
+        if (-not (Get-ChildItem $wh -Filter 'pyyaml-5.3.1-*.whl' -ErrorAction SilentlyContinue)) {
+          & '{{ cr15_python_dir }}\python.exe' -m pip wheel --disable-pip-version-check -q --no-deps --no-binary PyYAML `
+            -w $wh 'PyYAML==5.3.1' '--config-settings' '--global-option=--without-libyaml' 2>&1 | ForEach-Object { "$_" }
+          if ($LASTEXITCODE) { "pip wheel failed ($LASTEXITCODE)"; exit 1 }
+        }
+        New-Item -ItemType Directory -Force -Path 'C:\ProgramData\pip' | Out-Null
+        Set-Content -Path 'C:\ProgramData\pip\pip.ini' -Encoding ASCII -Value "[global]`r`nfind-links = $wh`r`n"
+        Get-ChildItem $wh -Filter *.whl | ForEach-Object { "wheelhouse: $($_.Name)" }
+      register: cr15_wheelhouse
+      retries: 2
+      delay: 30
+      until: cr15_wheelhouse is succeeded
+
     - name: Lab tool chain in its own environment (bandit, ruff, pip-audit, cyclonedx-bom), commands in C:\Tools\bin
       ansible.windows.win_shell: |
         $ErrorActionPreference = 'Continue'
