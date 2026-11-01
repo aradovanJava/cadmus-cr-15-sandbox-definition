@@ -137,6 +137,10 @@ Credentials and every other tunable are in `provisioning/group_vars/all.yml`.
 
 ## Notes for instructors
 
+- **Tested end to end on 31 Oct 2026:** allocation 1576 (commit `0466070`)
+  finished all three stages with `failed=0` on sc1, sq1 and owz1; every
+  self-test passed, including the ZAP scan of `http://sc1:8080/` from OWZ1
+  (High: Cross Site Scripting (Reflected) on `POST /account/login`).
 - **Pin the revision.** The platform reads `topology.yml` when the sandbox
   definition is created and does not pick up later commits on a branch.
 - **SC1 is managed over SSH** (`mgmt_protocol: ssh`); the Windows 11 image does
